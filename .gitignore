@@ -1,0 +1,6 @@
+sources/
+result/
+srpms/
+dist/
+*.rpm
+*.tar.gz

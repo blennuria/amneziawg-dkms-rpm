@@ -1,0 +1,235 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['[0-9]*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build el${{ matrix.el }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - el: 9
+            image: quay.io/centos/centos:stream9
+            mock_config: centos-stream+epel-9-x86_64
+          - el: 10
+            image: quay.io/centos/centos:stream10
+            mock_config: centos-stream+epel-10-x86_64
+
+    # The image must match the target EL: mock builds its bootstrap chroot
+    # from the host repositories, and a cross-release bootstrap fails on GPG
+    # key import. Same reason for --no-bootstrap-image below.
+    container:
+      image: ${{ matrix.image }}
+      # mock needs mount namespaces and overlayfs to set up the chroot
+      options: --privileged
+
+    steps:
+      - name: Install build tools
+        run: |
+          dnf install -y --nogpgcheck epel-release
+          dnf install -y --nogpgcheck mock rpm-build git-core
+
+          # mock refuses to run as root: it needs an unprivileged uid to drop
+          # privileges to, and regains root through its setuid wrapper. Group
+          # membership is what lets that wrapper's PAM stack through.
+          useradd -m builder
+          usermod -aG mock builder
+
+      - uses: actions/checkout@v7
+
+      - name: Download upstream sources
+        run: |
+          set -eux
+          mkdir -p sources
+          # Take the URLs from the specs instead of repeating them here, so a
+          # version bump is a one-line edit in one file.
+          for spec in amneziawg-dkms.spec amneziawg-tools.spec; do
+            url=$(rpmspec -P "$spec" | awk '$1 == "Source0:" { print $2 }')
+            # Source0 carries a #/basename fragment: strip it for the request,
+            # keep it as the file name mock and rpmbuild expect.
+            curl -fsSL -o "sources/${url##*/}" "${url%%#*}"
+          done
+          ls -la sources/
+
+      # A tag carries the release too (3.1.20260906-1), so the same version can
+      # be rebuilt as -2; refuse to publish packages the tag does not name. The
+      # kernel module is what the tag tracks — the tools carry their own
+      # upstream version and are simply rebuilt alongside it.
+      - name: Check tag matches spec
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          nvr=$(rpmspec -q --srpm --define 'dist %{nil}' \
+                  --qf '%{version}-%{release}\n' amneziawg-dkms.spec)
+          test "$GITHUB_REF_NAME" = "$nvr" || {
+            echo "tag $GITHUB_REF_NAME does not match amneziawg-dkms.spec $nvr" >&2
+            exit 1
+          }
+
+      - name: Build SRPMs
+        run: |
+          set -eux
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          for pkg in dkms tools; do
+            runuser -u builder -- mock -r ${{ matrix.mock_config }} --no-bootstrap-image \
+              --buildsrpm \
+              --spec "amneziawg-$pkg.spec" \
+              --sources sources/ \
+              --resultdir "result/srpm/$pkg"
+          done
+
+      - name: Build RPMs
+        run: |
+          set -eux
+          for pkg in dkms tools; do
+            runuser -u builder -- mock -r ${{ matrix.mock_config }} --no-bootstrap-image \
+              --rebuild "result/srpm/$pkg"/*.src.rpm \
+              --resultdir "result/rpm/$pkg"
+          done
+
+      - name: Collect packages
+        run: |
+          set -eux
+          mkdir -p dist srpms
+          find result/rpm  -name '*.rpm' ! -name '*.src.rpm' -exec cp -v {} dist/ \;
+          find result/srpm -name '*.src.rpm'                 -exec cp -v {} srpms/ \;
+          ls -la dist srpms
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: rpm-el${{ matrix.el }}
+          path: dist/*.rpm
+          if-no-files-found: error
+
+      - name: Upload source packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: srpm-el${{ matrix.el }}
+          path: srpms/*.src.rpm
+          if-no-files-found: error
+
+      - name: Upload mock logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-el${{ matrix.el }}
+          path: result/**/*.log
+          if-no-files-found: ignore
+
+  install-test:
+    name: install el${{ matrix.el }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - el: 9
+            image: quay.io/centos/centos:stream9
+          - el: 10
+            image: quay.io/centos/centos:stream10
+
+    container:
+      image: ${{ matrix.image }}
+
+    steps:
+      - name: Install runtime and kernel headers
+        run: |
+          set -eux
+          dnf install -y --nogpgcheck epel-release
+          # --enablerepo, not `dnf config-manager --set-enabled`: EL10 ships
+          # dnf5, which dropped that flag. elfutils-libelf-devel is the reason
+          # CRB has to be on at all.
+          dnf install -y --nogpgcheck --allowerasing --enablerepo=crb \
+              dkms kernel-devel gcc make elfutils-libelf-devel iproute
+
+          KVER=$(rpm -q kernel-devel --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort -V | tail -n 1)
+          echo "KVER=$KVER" | tee -a "$GITHUB_ENV"
+          # /lib/modules/$KVER/build is normally created by the `kernel`
+          # package, which we can't install inside a container — synth it.
+          if [ ! -f "/lib/modules/$KVER/build/Makefile" ]; then
+              mkdir -p "/lib/modules/$KVER"
+              ln -sfn "/usr/src/kernels/$KVER" "/lib/modules/$KVER/build"
+          fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: rpm-el${{ matrix.el }}
+          path: dist
+
+      - name: Inspect package metadata
+        run: |
+          rpm -qpi dist/amneziawg-dkms-[0-9]*.noarch.rpm dist/amneziawg-tools-[0-9]*.x86_64.rpm
+          rpm -qpR dist/amneziawg-dkms-[0-9]*.noarch.rpm dist/amneziawg-tools-[0-9]*.x86_64.rpm
+
+      - name: Install packages
+        run: |
+          dnf install -y dist/amneziawg-dkms-[0-9]*.noarch.rpm dist/amneziawg-tools-[0-9]*.x86_64.rpm
+
+      - name: Build the module with DKMS
+        run: |
+          set -eux
+          VER=$(rpm -q --qf '%{VERSION}\n' amneziawg-dkms)
+          # %posttrans built against $(uname -r) — which in a container is the
+          # host kernel and has no headers. Drive the build for the
+          # kernel-devel we actually installed.
+          if ! dkms install -m amneziawg -v "$VER" -k "$KVER"; then
+              cat "/var/lib/dkms/amneziawg/$VER/build/make.log" || :
+              exit 1
+          fi
+          dkms status -m amneziawg -v "$VER" | grep -E '\binstalled\b'
+
+          ko=$(find "/lib/modules/$KVER" -name 'amneziawg.ko*' -print -quit)
+          test -n "$ko"
+          modinfo "$ko"
+          # The version the module reports has to be the one the RPM claims,
+          # otherwise the %prep seds silently stopped matching upstream.
+          test "$(modinfo -F version "$ko")" = "$VER"
+
+      - name: Smoke-test the tools
+        run: |
+          set -eux
+          awg --version | grep -F "v$(rpm -q --qf '%{VERSION}' amneziawg-tools)"
+          awg genkey | awg pubkey | grep -Eq '^[A-Za-z0-9+/]{43}='
+          bash -n /usr/bin/awg-quick
+          test -d /etc/amnezia/amneziawg
+          grep -q '^ExecStart=/usr/bin/awg-quick up %i$' /usr/lib/systemd/system/awg-quick@.service
+
+  release:
+    name: release
+    needs: install-test
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: rpm-el*
+          merge-multiple: true
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Debug and source packages stay in the run artifacts; the specs live
+          # here and the build is reproducible from the tag, so publishing them
+          # is dead weight.
+          rm -f dist/*-debuginfo-*.rpm dist/*-debugsource-*.rpm
+          ls -la dist
+          gh release create "$GITHUB_REF_NAME" dist/*.rpm \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
