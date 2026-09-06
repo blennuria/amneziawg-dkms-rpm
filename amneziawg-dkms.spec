@@ -14,20 +14,24 @@ License:        GPL-2.0-only
 URL:            https://github.com/amnezia-vpn/amneziawg-linux-kernel-module
 Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz#/%{upstream}-%{version}.tar.gz
 
+# Upstream's compat layer decides what to shim from LINUX_VERSION_CODE alone,
+# which is wrong on EL: both CentOS Stream 9 and 10 backport APIs into kernels
+# that still call themselves 5.14 and 6.12, and the module then redefines them
+# and fails to build. Turns the four that bite into header probes. Upstream
+# pull request #174 addresses part of the same breakage for RHEL 10 only.
+Patch0:         0001-compat-probe-the-headers-for-backported-apis.patch
+
 BuildArch:      noarch
 BuildRequires:  make
 
-Requires:       dkms >= 2.2.0
-Requires:       gcc
-Requires:       make
-Requires(posttrans): dkms >= 2.2.0
-Requires(preun):     dkms >= 2.2.0
-# Weak on purpose: kernel-devel resolves to the newest kernel in the repos,
-# which is not necessarily the one that is running. Same for libelf, which
-# only some kernel trees need to relink their host tools.
-Recommends:     kernel-devel
-Recommends:     elfutils-libelf-devel
-Recommends:     amneziawg-tools
+# dkms is the only dependency worth naming: EPEL's dkms already requires gcc,
+# make, kmod and elfutils-libelf-devel, and pulls the kernel-devel *matching*
+# the installed kernel through `(kernel-devel-matched if kernel-core)` — a
+# plain `Recommends: kernel-devel` here would drag in the newest one instead.
+Requires:            dkms
+Requires(posttrans): dkms
+Requires(preun):     dkms
+Recommends:          amneziawg-tools
 
 Provides:       kmod(amneziawg.ko) = %{epoch}:%{version}-%{release}
 Conflicts:      kmod-%{module}
@@ -42,13 +46,13 @@ kernel update.
 The interface type provided by the module is `amneziawg`; the userspace side
 (awg, awg-quick) lives in the amneziawg-tools package.
 
-On EL10 and any other distribution where the `dkms` package ships
-/etc/dkms/sign_helper.sh, the built module is signed with a MOK key generated
-under /var/lib/dkms/. The %%posttrans scriptlet prints how to enrol that key
-with mokutil so the module can load under Secure Boot.
+EPEL's dkms signs the module with a MOK key it generates under /var/lib/dkms/
+(both EL9 and EL10 do this). The %%posttrans scriptlet prints how to enrol that
+key with mokutil, but only on a machine where Secure Boot is on and the key is
+not enrolled yet.
 
 %prep
-%autosetup -n %{upstream}-%{version}
+%autosetup -n %{upstream}-%{version} -p1
 
 # Upstream leaves a placeholder version in three places. DKMS reads dkms.conf,
 # kbuild reads version.h (the Makefile value only reaches the compiler on a
@@ -58,6 +62,10 @@ with mokutil so the module can load under Secure Boot.
 sed -i 's/^PACKAGE_VERSION=.*/PACKAGE_VERSION="%{version}"/'        src/dkms.conf
 sed -i 's/^WIREGUARD_VERSION = .*/WIREGUARD_VERSION = %{version}/'  src/Makefile
 sed -i 's/^#define WIREGUARD_VERSION .*/#define WIREGUARD_VERSION "%{version}"/' src/version.h
+
+# dkms 3.4 warns "Deprecated feature: REMAKE_INITRD" on every operation, and a
+# VPN module has no business in the initramfs to begin with.
+sed -i '/^REMAKE_INITRD=/d' src/dkms.conf
 
 %build
 # Nothing to compile at package time: DKMS builds the module on the target.

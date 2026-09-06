@@ -1,3 +1,11 @@
+# LTO off. EL9's make is 4.3, which passes its jobserver as file descriptors
+# and closes them for any recipe it does not recognise as a recursive make.
+# The link step is such a recipe, and -flto=auto makes gcc spawn a make of its
+# own inside it, which then dies with "write jobserver: Bad file descriptor".
+# EL10 (make 4.4, fifo jobserver) is not affected, but a ~100 KB CLI tool has
+# nothing to gain from LTO, so drop it on both instead of branching.
+%global _lto_cflags %{nil}
+
 Name:           amneziawg-tools
 Version:        3.1.20260812
 Release:        1%{?dist}
@@ -11,9 +19,9 @@ BuildRequires:  gcc
 BuildRequires:  make
 BuildRequires:  systemd-rpm-macros
 
-# Ships unit files but has no scriptlets to run: template units and a target
-# need neither enabling nor a daemon-reload on install.
-%{?systemd_requires}
+# No %%systemd_requires: this package has no scriptlets (a template unit and a
+# target need neither enabling nor a daemon-reload), and systemd is PID 1 on
+# every EL target anyway.
 
 # awg-quick(8) is a bash script driving `ip`; bash itself comes in through the
 # shebang's auto-generated dependency.

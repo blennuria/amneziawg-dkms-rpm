@@ -1,0 +1,100 @@
+From: blennuria <blennuria@pm.me>
+Subject: [PATCH] compat: probe the headers for backported APIs
+
+RHEL and CentOS Stream backport APIs into kernels whose LINUX_VERSION_CODE
+still names an older release. compat.h keys its shims off that version alone,
+so on those kernels it redefines things the kernel already provides:
+
+  CentOS Stream 9  (5.14.0-741.el9)   timer_container_of is backported and
+                                      from_timer is gone, so the shim expands
+                                      every timer callback to an undeclared
+                                      function:
+                                        error: implicit declaration of
+                                        function 'from_timer'
+  CentOS Stream 10 (6.12.0-264.el10)  struct sockaddr_inet,
+                                      netif_threaded_enable and struct
+                                      rtnl_newlink_params are all backported:
+                                        error: redefinition of
+                                        'struct sockaddr_inet'
+                                        error: static declaration of
+                                        'netif_threaded_enable' follows
+                                        non-static declaration
+                                        error: redefinition of
+                                        'struct rtnl_newlink_params'
+
+Probe the headers for those four, the way compat/Kbuild.include already probes
+for ptr_ring, siphash, dst_cache and friends, and skip the shim when the
+kernel has the real thing. Being a feature test rather than a version test,
+this needs no update when the next RHEL minor backports the next API, and it
+changes nothing for kernels that do not carry the backports.
+
+The rtnl_newlink_params probe also drops COMPAT_CANNOT_USE_RTNL_NEWLINK_PARAMS
+on those kernels, so device.c registers wg_newlink() with the signature their
+rtnl_link_ops actually expects.
+
+Addresses the same breakage as upstream issues #173 and #219 and pull request
+#174; unlike #174 this covers RHEL 9 and rtnl_newlink_params, and does not
+have to enumerate RHEL minor versions.
+
+diff -Nurp a/src/compat/Kbuild.include b/src/compat/Kbuild.include
+--- a/src/compat/Kbuild.include	2026-09-06 13:16:03
++++ b/src/compat/Kbuild.include	2026-09-06 15:36:33
+@@ -135,3 +135,23 @@ endif
+ ifeq ($(wildcard $(srctree)/include/linux/sprintf.h),)
+ ccflags-y += -I$(kbuild-dir)/compat/sprintf/include
+ endif
++
++# RHEL/CentOS Stream backport APIs into kernels whose LINUX_VERSION_CODE still
++# names an older release, so the version checks in compat.h define shims that
++# then collide with the real thing. Probe the headers for the ones that bite,
++# the same way this file already probes for ptr_ring, siphash and friends.
++ifneq ($(shell grep -s -F "define timer_container_of" "$(srctree)/include/linux/timer.h"),)
++ccflags-y += -DCOMPAT_HAVE_TIMER_CONTAINER_OF
++endif
++
++ifneq ($(shell grep -s -F "struct sockaddr_inet {" "$(srctree)/include/linux/in6.h" "$(srctree)/include/linux/socket.h"),)
++ccflags-y += -DCOMPAT_HAVE_SOCKADDR_INET
++endif
++
++ifneq ($(shell grep -s -F "netif_threaded_enable" "$(srctree)/include/linux/netdevice.h"),)
++ccflags-y += -DCOMPAT_HAVE_NETIF_THREADED_ENABLE
++endif
++
++ifneq ($(shell grep -s -F "struct rtnl_newlink_params {" "$(srctree)/include/net/rtnetlink.h"),)
++ccflags-y += -DCOMPAT_HAVE_RTNL_NEWLINK_PARAMS
++endif
+diff -Nurp a/src/compat/compat.h b/src/compat/compat.h
+--- a/src/compat/compat.h	2026-09-06 13:16:03
++++ b/src/compat/compat.h	2026-09-06 15:36:33
+@@ -1296,11 +1296,11 @@ static inline int timer_delete(struct timer_list *time
+ }
+ #endif
+ 
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0) && !defined(COMPAT_HAVE_TIMER_CONTAINER_OF)
+ #define timer_container_of from_timer
+ #endif
+ 
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0) && !defined(COMPAT_HAVE_SOCKADDR_INET)
+ #include <linux/in6.h>
+ struct sockaddr_inet {
+ 	unsigned short	sa_family;
+@@ -1309,7 +1309,7 @@ struct sockaddr_inet {
+ };
+ #endif
+ 
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0) && !defined(COMPAT_HAVE_NETIF_THREADED_ENABLE)
+ #include <linux/netdevice.h>
+ static inline void netif_threaded_enable(struct net_device *dev) { }
+ #endif
+@@ -1323,7 +1323,7 @@ static inline void netif_threaded_enable(struct net_de
+ #define COMPAT_CANNOT_USE_PCPU_STAT_TYPE
+ #endif
+ 
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 15, 0)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 15, 0) && !defined(COMPAT_HAVE_RTNL_NEWLINK_PARAMS)
+ #define COMPAT_CANNOT_USE_RTNL_NEWLINK_PARAMS
+ struct rtnl_newlink_params {
+ 	struct net *src_net;

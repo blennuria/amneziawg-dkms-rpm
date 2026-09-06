@@ -59,21 +59,9 @@ jobs:
             # keep it as the file name mock and rpmbuild expect.
             curl -fsSL -o "sources/${url##*/}" "${url%%#*}"
           done
+          # mock takes every Source and Patch from one directory
+          cp -v *.patch sources/
           ls -la sources/
-
-      # A tag carries the release too (3.1.20260906-1), so the same version can
-      # be rebuilt as -2; refuse to publish packages the tag does not name. The
-      # kernel module is what the tag tracks — the tools carry their own
-      # upstream version and are simply rebuilt alongside it.
-      - name: Check tag matches spec
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          nvr=$(rpmspec -q --srpm --define 'dist %{nil}' \
-                  --qf '%{version}-%{release}\n' amneziawg-dkms.spec)
-          test "$GITHUB_REF_NAME" = "$nvr" || {
-            echo "tag $GITHUB_REF_NAME does not match amneziawg-dkms.spec $nvr" >&2
-            exit 1
-          }
 
       - name: Build SRPMs
         run: |
@@ -224,12 +212,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -eux
           # Debug and source packages stay in the run artifacts; the specs live
           # here and the build is reproducible from the tag, so publishing them
           # is dead weight.
           rm -f dist/*-debuginfo-*.rpm dist/*-debugsource-*.rpm
           ls -la dist
+
+          # The tag names the release, not a package version — the two packages
+          # track separate upstreams — so spell the versions out here instead.
+          nv() { basename "$(ls dist/$1-[0-9]*.rpm | head -n 1)" \
+                 | sed -E "s/^$1-([^-]+)-.*/\1/"; }
+          dkms_v=$(nv amneziawg-dkms)
+          tools_v=$(nv amneziawg-tools)
+
           gh release create "$GITHUB_REF_NAME" dist/*.rpm \
             --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME (kmod $dkms_v, tools $tools_v)" \
+            --notes "EL9 and EL10, x86_64. Built from upstream tags [v$dkms_v](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module/releases/tag/v$dkms_v) (kernel module) and [v$tools_v](https://github.com/amnezia-vpn/amneziawg-tools/releases/tag/v$tools_v) (tools)." \
             --generate-notes

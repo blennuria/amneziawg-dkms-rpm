@@ -18,16 +18,21 @@ over a package installed from there.
 ## Install
 
 ```shell
-# dkms itself lives in EPEL
+# dkms itself lives in EPEL, and drags in gcc, make and the kernel-devel
+# matching the running kernel
 sudo dnf install -y epel-release
+
+# file names from the latest release, e.g. for EL9:
+base=https://github.com/blennuria/amneziawg-rpm/releases/latest/download
 sudo dnf install -y \
-    https://github.com/<owner>/amneziawg-rpm/releases/latest/download/amneziawg-dkms-<nvr>.noarch.rpm \
-    https://github.com/<owner>/amneziawg-rpm/releases/latest/download/amneziawg-tools-<nvr>.x86_64.rpm
+    $base/amneziawg-dkms-3.1.20260906-1.el9.noarch.rpm \
+    $base/amneziawg-tools-3.1.20260812-1.el9.x86_64.rpm
 ```
 
-`%posttrans` runs `dkms autoinstall` for the running kernel. If the machine has
-no `kernel-devel` matching it (typical right after a kernel update, before the
-reboot), the build is skipped with a warning — `dkms status` afterwards tells
+`%posttrans` runs `dkms install` for the running kernel (and honours
+`/etc/dkms/no-autoinstall`). If the machine has no `kernel-devel` matching it
+(typical right after a kernel update, before the reboot), the build is skipped
+with a warning — `dkms status` afterwards tells
 you where things stand, and `/var/lib/dkms/amneziawg/<version>/build/make.log`
 says why a build failed.
 
@@ -60,13 +65,65 @@ sudo systemctl enable --now awg-quick@awg0
 ## Updating
 
 Bump `Version:` in the spec of whichever component moved, add a `%changelog`
-entry, and push a tag. Nothing else references the version — the workflow
-takes the source URLs straight out of the specs.
+entry, and push a tag. Nothing else references the version — the workflow takes
+the source URLs straight out of the specs.
 
-Tags are `<version>-<release>` of **`amneziawg-dkms`** (e.g. `3.1.20260906-1`),
-and the build refuses to publish if the tag and that spec disagree. The tools
-carry their own upstream version and are rebuilt alongside; releasing a
-tools-only update means bumping the dkms `Release:` and tagging that.
+Tags name the release, not a package: `YYYYMMDD` (`20260906.1` for a second one
+the same day). The two components track separate upstreams with separate
+version streams, so a tag can't stand for both — pinning it to one of them
+would mean inventing a `Release:` bump for the other every time only it moved.
+The versions actually shipped are in the release title, the notes and the file
+names.
+
+## Patches
+
+`0001-compat-probe-the-headers-for-backported-apis.patch` is the only local
+change, and without it the module compiles on neither target. Upstream's
+compat layer picks its shims from `LINUX_VERSION_CODE` alone, while EL kernels
+backport APIs without moving that number:
+
+- Stream 9 (5.14.0-741) has `timer_container_of` and no longer has
+  `from_timer`, so every timer callback fails with
+  `implicit declaration of function 'from_timer'`;
+- Stream 10 (6.12.0-264) has `struct sockaddr_inet`, `netif_threaded_enable`
+  and `struct rtnl_newlink_params`, each of which the compat layer defines a
+  second time.
+
+The patch turns those four into header probes in `compat/Kbuild.include`,
+next to the ones already there for ptr_ring, siphash and dst_cache, so no
+version numbers have to be kept up to date. Upstream PR
+[#174](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module/pull/174)
+fixes part of the same breakage for RHEL 10 by enumerating minor releases;
+drop this patch if that or an equivalent lands upstream.
+
+## Testing locally
+
+The CI jobs are reproducible in a container — `podman`, `docker` or Apple's
+`container`, with `--arch amd64` where the host is not x86_64:
+
+```shell
+container run --rm --arch amd64 -v "$PWD":/work quay.io/centos/centos:stream9 bash -c '
+  dnf install -y --nogpgcheck epel-release
+  dnf install -y --nogpgcheck --enablerepo=crb rpm-build rpmdevtools gcc make       systemd-rpm-macros dkms kernel-devel elfutils-libelf-devel
+  rpmdev-setuptree && cp /work/*.spec ~/rpmbuild/SPECS/ && cp /work/*.patch ~/rpmbuild/SOURCES/
+  spectool -g -C ~/rpmbuild/SOURCES ~/rpmbuild/SPECS/*.spec
+  rpmbuild -ba ~/rpmbuild/SPECS/amneziawg-dkms.spec'
+```
+
+Then `dnf install` the results and drive the build with
+`dkms install -m amneziawg -v <version> -k <kernel-devel version>`; in a
+container `%posttrans` cannot do it for you, because `uname -r` is the host's
+kernel.
+
+## Why one repository
+
+The packages come from two upstreams, but they are installed, upgraded and
+tested as a pair: `awg-quick` is useless without the module and the module is
+unreachable without `awg`. One repo means one release page holding a matching
+set, one workflow, and one place to point a `createrepo` job at later. The cost
+is that a change to either component republishes both — a few minutes of CI and
+an unchanged package rebuilt under a new release tag, which is cheaper than
+keeping two repositories in step by hand.
 
 ## CI
 
