@@ -63,6 +63,35 @@ jobs:
           cp -v *.patch sources/
           ls -la sources/
 
+      # The two upstreams are tagged together on joint release days (20260730,
+      # 20260805, 20260812) and separately in between — the kernel module has
+      # had three releases of its own since the last tools one — so the pair we
+      # package is mismatched on paper by design. What has to match is the
+      # netlink API: if the module grows an attribute the tools do not know,
+      # `awg` silently cannot configure it. Compare the two copies of the uapi
+      # header instead of the version strings. The repos spell attribute 11
+      # differently (WGPEER_A_ADVANCED_SECURITY in the module, WGPEER_A_AWG in
+      # the tools) for the same value, so fold one onto the other.
+      - name: Check the tools speak the module's netlink API
+        run: |
+          set -eu
+          kver=$(rpmspec -q --srpm --qf '%{version}\n' amneziawg-dkms.spec)
+          tver=$(rpmspec -q --srpm --qf '%{version}\n' amneziawg-tools.spec)
+          tar xf "sources/amneziawg-linux-kernel-module-$kver.tar.gz" \
+              -O "amneziawg-linux-kernel-module-$kver/src/uapi/wireguard.h" > /tmp/kmod-uapi.h
+          tar xf "sources/amneziawg-tools-$tver.tar.gz" \
+              -O "amneziawg-tools-$tver/src/uapi/linux/linux/wireguard.h" > /tmp/tools-uapi.h
+          attrs() {
+            grep -oE 'WG(DEVICE|PEER)_A_[A-Z0-9_]+' "$1" \
+              | sed 's/^WGPEER_A_AWG$/WGPEER_A_ADVANCED_SECURITY/' | sort -u
+          }
+          diff <(attrs /tmp/kmod-uapi.h) <(attrs /tmp/tools-uapi.h) || {
+            echo "module $kver and tools $tver disagree on the netlink API" >&2
+            echo "(< only the module has it, > only the tools have it)" >&2
+            exit 1
+          }
+          echo "netlink API matches: $(attrs /tmp/kmod-uapi.h | wc -l) attributes"
+
       - name: Build SRPMs
         run: |
           set -eux

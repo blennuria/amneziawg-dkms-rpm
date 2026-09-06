@@ -75,6 +75,27 @@ would mean inventing a `Release:` bump for the other every time only it moved.
 The versions actually shipped are in the release title, the notes and the file
 names.
 
+### Which versions pair up
+
+Upstream tags the two repos with the same date on joint release days
+(`v3.0.20260730`, `v3.0.20260805`, `v3.1.20260812`) and separately in between —
+the kernel module has had three releases of its own since the last tools tag.
+So take the newest tag of each and don't try to make the dates line up.
+
+What has to match is the netlink API, not the version string: if the module
+grows an attribute the tools don't know, `awg` silently cannot configure it.
+The build compares the module's `src/uapi/wireguard.h` against the tools'
+`src/uapi/linux/linux/wireguard.h` and fails when the attribute sets differ, so
+a bump that outruns the other side is caught before anything ships. (The two
+repos spell attribute 11 differently — `WGPEER_A_ADVANCED_SECURITY` versus
+`WGPEER_A_AWG` — for the same value; the check folds one onto the other.)
+
+The pair shipped here, module 3.1.20260906 with tools 3.1.20260812, is
+byte-identical in that header to the last joint release. The seven module
+commits since are internal: an uninitialised spinlock in `header_protection`,
+`DisableCookies` and `RandomPaddingAddition` corrections, a fix for random
+trailers on I1–I5 junk packets, and build fixes for kernel 7.1.5+.
+
 ## Patches
 
 `0001-compat-probe-the-headers-for-backported-apis.patch` is the only local
@@ -129,8 +150,8 @@ keeping two repositories in step by hand.
 
 `.github/workflows/build.yml`:
 
-1. **build** — mock builds SRPM + RPM for both specs in a CentOS Stream 9/10
-   container.
+1. **build** — checks that the two upstreams agree on the netlink API, then
+   has mock build SRPM + RPM for both specs in a CentOS Stream 9/10 container.
 2. **install-test** — installs the packages on the matching EL, builds the
    module against that release's `kernel-devel`, checks `modinfo` reports the
    packaged version, and smoke-tests `awg`.
