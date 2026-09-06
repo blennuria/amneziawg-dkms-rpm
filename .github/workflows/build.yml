@@ -47,92 +47,55 @@ jobs:
 
       - uses: actions/checkout@v7
 
-      - name: Download upstream sources
+      - name: Prepare sources
         run: |
           set -eux
           mkdir -p sources
-          # Take the URLs from the specs instead of repeating them here, so a
+          # Take the URL from the spec instead of repeating it here, so a
           # version bump is a one-line edit in one file.
-          for spec in amneziawg-dkms.spec amneziawg-tools.spec; do
-            url=$(rpmspec -P "$spec" | awk '$1 == "Source0:" { print $2 }')
-            # Source0 carries a #/basename fragment: strip it for the request,
-            # keep it as the file name mock and rpmbuild expect.
-            curl -fsSL -o "sources/${url##*/}" "${url%%#*}"
-          done
+          url=$(rpmspec -P amneziawg-dkms.spec | awk '$1 == "Source0:" { print $2 }')
+          # Source0 carries a #/basename fragment: strip it for the request,
+          # keep it as the file name mock and rpmbuild expect.
+          curl -fsSL -o "sources/${url##*/}" "${url%%#*}"
           # mock takes every Source and Patch from one directory
           cp -v *.patch sources/
           ls -la sources/
 
-      # The two upstreams are tagged together on joint release days (20260730,
-      # 20260805, 20260812) and separately in between — the kernel module has
-      # had three releases of its own since the last tools one — so the pair we
-      # package is mismatched on paper by design. What has to match is the
-      # netlink API: if the module grows an attribute the tools do not know,
-      # `awg` silently cannot configure it. Compare the two copies of the uapi
-      # header instead of the version strings. The repos spell attribute 11
-      # differently (WGPEER_A_ADVANCED_SECURITY in the module, WGPEER_A_AWG in
-      # the tools) for the same value, so fold one onto the other.
-      - name: Check the tools speak the module's netlink API
+      # A tag carries the release too (3.1.20260906-1), so the same version can
+      # be rebuilt as -2; refuse to publish packages the tag does not name.
+      - name: Check tag matches spec
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
-          set -eu
-          kver=$(rpmspec -q --srpm --qf '%{version}\n' amneziawg-dkms.spec)
-          tver=$(rpmspec -q --srpm --qf '%{version}\n' amneziawg-tools.spec)
-          tar xf "sources/amneziawg-linux-kernel-module-$kver.tar.gz" \
-              -O "amneziawg-linux-kernel-module-$kver/src/uapi/wireguard.h" > /tmp/kmod-uapi.h
-          tar xf "sources/amneziawg-tools-$tver.tar.gz" \
-              -O "amneziawg-tools-$tver/src/uapi/linux/linux/wireguard.h" > /tmp/tools-uapi.h
-          attrs() {
-            grep -oE 'WG(DEVICE|PEER)_A_[A-Z0-9_]+' "$1" \
-              | sed 's/^WGPEER_A_AWG$/WGPEER_A_ADVANCED_SECURITY/' | sort -u
-          }
-          diff <(attrs /tmp/kmod-uapi.h) <(attrs /tmp/tools-uapi.h) || {
-            echo "module $kver and tools $tver disagree on the netlink API" >&2
-            echo "(< only the module has it, > only the tools have it)" >&2
+          nvr=$(rpmspec -q --srpm --define 'dist %{nil}' \
+                  --qf '%{version}-%{release}\n' amneziawg-dkms.spec)
+          test "$GITHUB_REF_NAME" = "$nvr" || {
+            echo "tag $GITHUB_REF_NAME does not match amneziawg-dkms.spec $nvr" >&2
             exit 1
           }
-          echo "netlink API matches: $(attrs /tmp/kmod-uapi.h | wc -l) attributes"
 
-      - name: Build SRPMs
+      - name: Build SRPM
         run: |
           set -eux
           chown -R builder:builder "$GITHUB_WORKSPACE"
-          for pkg in dkms tools; do
-            runuser -u builder -- mock -r ${{ matrix.mock_config }} --no-bootstrap-image \
-              --buildsrpm \
-              --spec "amneziawg-$pkg.spec" \
-              --sources sources/ \
-              --resultdir "result/srpm/$pkg"
-          done
+          runuser -u builder -- mock -r ${{ matrix.mock_config }} --no-bootstrap-image \
+            --buildsrpm \
+            --spec amneziawg-dkms.spec \
+            --sources sources/ \
+            --resultdir result/srpm
 
-      - name: Build RPMs
+      - name: Build RPM
         run: |
-          set -eux
-          for pkg in dkms tools; do
-            runuser -u builder -- mock -r ${{ matrix.mock_config }} --no-bootstrap-image \
-              --rebuild "result/srpm/$pkg"/*.src.rpm \
-              --resultdir "result/rpm/$pkg"
-          done
-
-      - name: Collect packages
-        run: |
-          set -eux
-          mkdir -p dist srpms
-          find result/rpm  -name '*.rpm' ! -name '*.src.rpm' -exec cp -v {} dist/ \;
-          find result/srpm -name '*.src.rpm'                 -exec cp -v {} srpms/ \;
-          ls -la dist srpms
+          runuser -u builder -- mock -r ${{ matrix.mock_config }} --no-bootstrap-image \
+            --rebuild result/srpm/*.src.rpm \
+            --resultdir result/rpm
 
       - name: Upload packages
         uses: actions/upload-artifact@v7
         with:
           name: rpm-el${{ matrix.el }}
-          path: dist/*.rpm
-          if-no-files-found: error
-
-      - name: Upload source packages
-        uses: actions/upload-artifact@v7
-        with:
-          name: srpm-el${{ matrix.el }}
-          path: srpms/*.src.rpm
+          path: |
+            result/rpm/*.rpm
+            !result/rpm/*.src.rpm
           if-no-files-found: error
 
       - name: Upload mock logs on failure
@@ -144,7 +107,7 @@ jobs:
           if-no-files-found: ignore
 
   install-test:
-    name: install el${{ matrix.el }}
+    name: dkms build on el${{ matrix.el }}
     needs: build
     runs-on: ubuntu-latest
     strategy:
@@ -168,7 +131,7 @@ jobs:
           # dnf5, which dropped that flag. elfutils-libelf-devel is the reason
           # CRB has to be on at all.
           dnf install -y --nogpgcheck --allowerasing --enablerepo=crb \
-              dkms kernel-devel gcc make elfutils-libelf-devel iproute
+              dkms kernel-devel gcc make elfutils-libelf-devel
 
           KVER=$(rpm -q kernel-devel --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort -V | tail -n 1)
           echo "KVER=$KVER" | tee -a "$GITHUB_ENV"
@@ -186,12 +149,11 @@ jobs:
 
       - name: Inspect package metadata
         run: |
-          rpm -qpi dist/amneziawg-dkms-[0-9]*.noarch.rpm dist/amneziawg-tools-[0-9]*.x86_64.rpm
-          rpm -qpR dist/amneziawg-dkms-[0-9]*.noarch.rpm dist/amneziawg-tools-[0-9]*.x86_64.rpm
+          rpm -qpi dist/amneziawg-dkms-[0-9]*.noarch.rpm
+          rpm -qpR dist/amneziawg-dkms-[0-9]*.noarch.rpm
 
-      - name: Install packages
-        run: |
-          dnf install -y dist/amneziawg-dkms-[0-9]*.noarch.rpm dist/amneziawg-tools-[0-9]*.x86_64.rpm
+      - name: Install the package
+        run: dnf install -y dist/amneziawg-dkms-[0-9]*.noarch.rpm
 
       - name: Build the module with DKMS
         run: |
@@ -212,15 +174,17 @@ jobs:
           # The version the module reports has to be the one the RPM claims,
           # otherwise the %prep seds silently stopped matching upstream.
           test "$(modinfo -F version "$ko")" = "$VER"
+          # rtnl and genl aliases are what make `ip link add type amneziawg`
+          # and awg(8) load the module on demand.
+          modinfo -F alias "$ko" | grep -qx 'rtnl-link-amneziawg'
 
-      - name: Smoke-test the tools
+      - name: Check the erase path
         run: |
           set -eux
-          awg --version | grep -F "v$(rpm -q --qf '%{VERSION}' amneziawg-tools)"
-          awg genkey | awg pubkey | grep -Eq '^[A-Za-z0-9+/]{43}='
-          bash -n /usr/bin/awg-quick
-          test -d /etc/amnezia/amneziawg
-          grep -q '^ExecStart=/usr/bin/awg-quick up %i$' /usr/lib/systemd/system/awg-quick@.service
+          VER=$(rpm -q --qf '%{VERSION}\n' amneziawg-dkms)
+          dnf remove -y amneziawg-dkms
+          test -z "$(dkms status -m amneziawg 2>/dev/null)"
+          test ! -e "/usr/src/amneziawg-$VER"
 
   release:
     name: release
@@ -241,22 +205,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -eux
-          # Debug and source packages stay in the run artifacts; the specs live
-          # here and the build is reproducible from the tag, so publishing them
-          # is dead weight.
-          rm -f dist/*-debuginfo-*.rpm dist/*-debugsource-*.rpm
           ls -la dist
-
-          # The tag names the release, not a package version — the two packages
-          # track separate upstreams — so spell the versions out here instead.
-          nv() { basename "$(ls dist/$1-[0-9]*.rpm | head -n 1)" \
-                 | sed -E "s/^$1-([^-]+)-.*/\1/"; }
-          dkms_v=$(nv amneziawg-dkms)
-          tools_v=$(nv amneziawg-tools)
-
           gh release create "$GITHUB_REF_NAME" dist/*.rpm \
             --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME (kmod $dkms_v, tools $tools_v)" \
-            --notes "EL9 and EL10, x86_64. Built from upstream tags [v$dkms_v](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module/releases/tag/v$dkms_v) (kernel module) and [v$tools_v](https://github.com/amnezia-vpn/amneziawg-tools/releases/tag/v$tools_v) (tools)." \
+            --title "$GITHUB_REF_NAME" \
             --generate-notes
